@@ -45,8 +45,10 @@ def test_full_loop_edits_files_and_runs_shell(cfg, mock_api, tmp_path):
     req = mock_api.requests[1]
     assert req["headers"]["x-api-key"] == "sk-test-key-1234567890abcdef"
     body = req["body"]
-    assert body["tools"][-1]["cache_control"]["type"] == "ephemeral"
+    # breakpoint on the static system block caches tools + static prompt; another on the dynamic block
+    assert body["system"][0]["cache_control"]["type"] == "ephemeral"
     assert body["system"][-1].get("cache_control")
+    assert "cache_control" not in body["tools"][-1]
     assert body["thinking"] == {"type": "adaptive"}
     # session persisted and loadable
     s2 = Session.load(cfg.home, s.id)
@@ -124,9 +126,26 @@ def test_subagent(cfg, mock_api, tmp_path):
     ]
     a = Agent(cfg, Session(cwd=str(tmp_path)), None, interactive=False)
     assert a.run("go") == "main done"
-    sub_tools = {t["name"] for t in mock_api.requests[1]["body"]["tools"]}
-    assert "task" not in sub_tools and "write_file" not in sub_tools and "bash" not in sub_tools
+    main_req, sub_req = mock_api.requests[0]["body"], mock_api.requests[1]["body"]
+    # identical tools + static system block -> the sub-agent reuses the main agent's prompt cache
+    assert sub_req["tools"] == main_req["tools"]
+    assert sub_req["system"][0]["text"] == main_req["system"][0]["text"]
+    assert "EXPLORE MODE" in sub_req["system"][1]["text"]
     assert "sub report" in json.dumps(mock_api.requests[2]["body"]["messages"])
+
+
+def test_subagent_explore_blocks_writes(cfg, mock_api, tmp_path):
+    mock_api.script = [
+        tool_step(("task", {"prompt": "explore", "description": "explore"})),
+        tool_step(("write_file", {"path": "x.txt", "content": "no"}), ("task", {"prompt": "nested"})),
+        text_step("sub report"),
+        text_step("main done"),
+    ]
+    a = Agent(cfg, Session(cwd=str(tmp_path)), None, interactive=False)
+    assert a.run("go") == "main done"
+    assert not (tmp_path / "x.txt").exists()
+    res = json.dumps(mock_api.requests[2]["body"]["messages"][-1])
+    assert "explore (read-only) mode" in res and "not available to sub-agents" in res
 
 
 def test_push_to_main_blocked(cfg, tmp_path):

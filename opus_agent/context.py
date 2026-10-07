@@ -110,6 +110,18 @@ def prune(messages: list[dict[str, Any]], keep_recent: int = 8) -> int:
     return saved
 
 
+def strip_thinking(messages: list[dict[str, Any]]) -> int:
+    """Remove all thinking blocks (needed when switching model: signatures are model-bound)."""
+    n = 0
+    for m in messages:
+        if m["role"] == "assistant" and isinstance(m["content"], list):
+            kept = [b for b in m["content"] if b.get("type") not in ("thinking", "redacted_thinking")]
+            if len(kept) != len(m["content"]):
+                n += len(m["content"]) - len(kept)
+                m["content"] = kept or [{"type": "text", "text": "(thinking)"}]
+    return n
+
+
 def clean_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Remove internal markers before sending."""
     out = []
@@ -145,7 +157,9 @@ def compact(agent) -> str:
         last = msgs[-1]
         content = last["content"] if isinstance(last["content"], list) else [{"type": "text", "text": last["content"]}]
         req = msgs[:-1] + [{"role": "user", "content": content + [{"type": "text", "text": COMPACT_PROMPT}]}]
-    resp = agent.llm.create(s.system, req, tools=agent.tool_specs(), max_tokens=12000, thinking=False,
+    # Same system, tools and thinking setting as the main loop: changing any of them would
+    # invalidate the prompt cache, and this call re-sends the entire (large) history.
+    resp = agent.llm.create(s.system, req, tools=agent.tool_specs(), max_tokens=None, thinking=True,
                             cb=agent.quiet_cb())
     agent.account(resp.usage)
     summary = resp.text.strip() or "(summary unavailable)"
@@ -160,6 +174,7 @@ def compact(agent) -> str:
     }]
     s.compactions += 1
     agent.ctx.read_files.clear()
+    agent.refresh_system(force=True)  # cache is cold anyway: pick up fresh env/memory
     s.last_prompt_tokens = estimate_tokens(s.messages) + estimate_tokens(s.system)
     log.info("compacted session %s (#%d)", s.id, s.compactions)
     return summary

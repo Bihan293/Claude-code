@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opus-agent"
-version = "1.0.0"
+version = "1.1.0"
 description = "Autonomous Claude Code-like CLI coding agent for Android Termux (Anthropic Messages API / Tooken Club)"
 readme = "README.md"
 requires-python = ">=3.10"

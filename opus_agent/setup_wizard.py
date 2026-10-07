@@ -45,7 +45,9 @@ def setup_api(cfg, force: bool = False) -> bool:
         print("API key already configured.")
         return True
     base = _ask("Base URL", cfg.get("base_url"))
-    model = _ask("Model", cfg.get("model"))
+    from .models import menu, resolve
+    print(menu(cfg.get("model")))
+    model = resolve(_ask("Model (1/2/3 or id)", cfg.get("model"))) or cfg.get("model")
     cfg.set("base_url", base)
     cfg.set("model", model)
     for _ in range(3):

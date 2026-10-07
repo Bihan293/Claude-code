@@ -14,7 +14,7 @@ from .checkpoints import Checkpoints
 from .llm import Callbacks, ContextTooLong, Interrupted, LLMClient, LLMError, Usage
 from .memory import Memory
 from .notify import notify, wake_lock
-from .prompts import build_system
+from .prompts import CORE, build_system
 from .security import log, redact
 from .session import Session
 from .usage import record_usage
@@ -94,18 +94,33 @@ class Agent:
         return self.cfg.get("permission_mode") == "readonly" or self.mode == "explore"
 
     def tool_specs(self) -> list[dict[str, Any]]:
-        specs = []
-        for t in REGISTRY.values():
-            if self.subagent and not t.subagent_ok:
-                continue
-            if self.mode == "explore" and not t.readonly_ok:
-                continue
-            specs.append(t.spec())
-        return specs  # stable order -> stable cache prefix
+        # The same full list for main agent, sub-agents and every mode: tools are the first
+        # part of the cached prefix, so an identical list lets sub-agents reuse the main
+        # agent's cache. Disallowed tools are rejected at execution time (tool_allowed).
+        return [t.spec() for t in REGISTRY.values()]  # stable order -> stable cache prefix
 
-    def refresh_system(self) -> None:
-        self.session.system = build_system(self.ctx.cwd, self.memory.render(), plan_mode=self.plan_mode(),
-                                           subagent=self.subagent)
+    def tool_allowed(self, name: str) -> str | None:
+        t = REGISTRY.get(name)
+        if t is None:
+            return None
+        if self.subagent and not t.subagent_ok:
+            return f"Tool '{name}' is not available to sub-agents."
+        if self.mode == "explore" and not t.readonly_ok:
+            return f"Tool '{name}' is disabled in explore (read-only) mode. Use read-only tools."
+        return None
+
+    def refresh_system(self, force: bool = False) -> None:
+        """Build the system prompt. Within a running conversation the dynamic block
+        (git status, memory, date) is kept frozen: changing it would invalidate the prompt
+        cache for the whole history and re-bill it at cache-write price on every turn.
+        It is rebuilt for a new/compacted conversation, on mode change, or when forced."""
+        key = f"{self.plan_mode()}|{self.subagent}|{self.mode}"
+        meta = self.session.meta
+        if (force or not self.session.system or len(self.session.messages) <= 1
+                or meta.get("system_key") != key or self.session.system[0].get("text") != CORE):
+            self.session.system = build_system(self.ctx.cwd, self.memory.render(), plan_mode=self.plan_mode(),
+                                               subagent=self.subagent, explore=self.mode == "explore")
+            meta["system_key"] = key
 
     def account(self, usage: dict[str, Any]) -> None:
         with self._lock:
@@ -292,7 +307,11 @@ class Agent:
             if self.ui:
                 self.ui.tool_call(name, args, sub=self.subagent)
             t0 = time.time()
-            out, is_err = run_tool(self.ctx, name, args if isinstance(args, dict) else {})
+            denied = self.tool_allowed(name)
+            if denied:
+                out, is_err = denied, True
+            else:
+                out, is_err = run_tool(self.ctx, name, args if isinstance(args, dict) else {})
             if self.ui:
                 self.ui.tool_result(name, out, is_err, time.time() - t0, sub=self.subagent)
             r: dict[str, Any] = {"type": "tool_result", "tool_use_id": uid, "content": out if out else "(no output)"}

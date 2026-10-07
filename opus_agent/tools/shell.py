@@ -180,7 +180,7 @@ def bash(ctx: ToolContext, command: str, timeout: int | None = None, run_in_back
         status = f"TIMED OUT after {t}s (killed). Consider run_in_background=true"
     if interrupted:
         status = "INTERRUPTED by user"
-    limit = int(ctx.cfg.get("tool_output_limit", 30000))
+    limit = min(int(ctx.cfg.get("tool_output_limit", 30000)), int(ctx.cfg.get("shell_output_limit", 16000)))
     if len(out) > limit:
         # keep the tail (errors are usually at the end)
         out = out[: limit // 4] + f"\n... [{len(out) - limit} chars omitted] ...\n" + out[-(limit * 3 // 4):]
@@ -221,7 +221,8 @@ def job_output(ctx: ToolContext, job_id: str, wait: int = 0) -> str:
     rc = job.poll()
     out = _clean(job.new_output())
     state = "running" if rc is None else f"exited with code {rc}"
-    return f"[job {job_id}: {state}; {time.time() - job.started:.0f}s]\n{out[-20000:] if out else '(no new output)'}"
+    lim = int(ctx.cfg.get("shell_output_limit", 16000))
+    return f"[job {job_id}: {state}; {time.time() - job.started:.0f}s]\n{out[-lim:] if out else '(no new output)'}"
 
 
 @tool("job_kill", "Kill a background job.", {"job_id": {"type": "string"}}, ["job_id"], shell=True)
