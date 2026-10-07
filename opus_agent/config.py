@@ -37,6 +37,9 @@ def home_dir() -> Path:
 DEFAULTS: dict[str, Any] = {
     "base_url": "https://tooken.club/v1",
     "model": "claude-opus-5-5",
+    # API format: "auto" (by model: claude-* -> Anthropic Messages, gpt-* -> OpenAI Chat
+    # Completions), or force "anthropic" / "openai"
+    "api_format": "auto",
     # model used for cheap auxiliary work (sub-agents exploration, summaries).
     # empty string -> use main model
     "small_model": "",
@@ -52,6 +55,7 @@ DEFAULTS: dict[str, Any] = {
     "compact_threshold": 0.78,    # summarize whole history (one model call)
     "keep_recent_tool_results": 8,
     "tool_output_limit": 30000,   # chars returned to model per tool call
+    "shell_output_limit": 16000,  # chars of bash/job output (head 1/4 + tail 3/4, errors are at the end)
     "max_iterations": 300,        # model calls per task
     "stream": True,
     "auth_style": "both",         # "x-api-key" | "bearer" | "both"

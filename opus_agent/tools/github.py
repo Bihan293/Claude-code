@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from typing import Any
 
 import httpx
@@ -83,7 +84,8 @@ Actions:
 - pr_list {state?} | pr_get {number} (details, files, reviews, comments) | pr_diff {number}
 - pr_create {title, body, head?, base?, draft?}  (head defaults to current branch, base to default branch)
 - pr_comment {number, body} | pr_merge {number, method?}
-- checks {ref? or number?}  (CI status: check runs + commit statuses + workflow runs for branch)
+- checks {ref? or number?, wait?}  (CI status: check runs + commit statuses + workflow runs.
+  wait=seconds (max 900) blocks until all checks finish – use it instead of sleep+poll loops)
 - run_logs {run_id}  (failed job logs of a workflow run, tail of each failed step)
 - rerun {run_id}
 Push your branch with `git push -u origin <branch>` (bash) before pr_create.""",
@@ -93,7 +95,8 @@ Push your branch with `git push -u origin <branch>` (bash) before pr_create.""",
        "title": {"type": "string"}, "body": {"type": "string"},
        "head": {"type": "string"}, "base": {"type": "string"}, "draft": {"type": "boolean"},
        "state": {"type": "string"}, "labels": {"type": "string"}, "limit": {"type": "integer"},
-       "ref": {"type": "string"}, "run_id": {"type": "integer"}, "method": {"type": "string"}},
+       "ref": {"type": "string"}, "run_id": {"type": "integer"}, "method": {"type": "string"},
+       "wait": {"type": "integer"}},
       ["action"], readonly_ok=True)
 def github(ctx: ToolContext, action: str, repo: str = "", **kw: Any) -> str:
     cfg = ctx.cfg
@@ -188,27 +191,15 @@ def github(ctx: ToolContext, action: str, repo: str = "", **kw: Any) -> str:
         j = gh_request(cfg, "PUT", f"{R}/pulls/{n}/merge", body={"merge_method": kw.get("method") or "squash"})
         return f"Merged: {j.get('message')}"
     if action == "checks":
-        ref = kw.get("ref")
-        if n and not ref:
-            ref = gh_request(cfg, "GET", f"{R}/pulls/{n}")["head"]["sha"]
-        if not ref:
-            ref = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(ctx.cwd), capture_output=True, text=True,
-                                 timeout=10).stdout.strip()
-        out = [f"Checks for {ref[:12]}:"]
-        cr = gh_request(cfg, "GET", f"{R}/commits/{ref}/check-runs", params={"per_page": 100})
-        for c in cr.get("check_runs", []):
-            out.append(f"  {c['name']}: {c['status']}/{c.get('conclusion')} {c.get('html_url', '')}")
-            if c.get("conclusion") in ("failure", "timed_out") and c.get("output", {}).get("summary"):
-                out.append("    " + (c["output"]["summary"] or "")[:800].replace("\n", "\n    "))
-        st = gh_request(cfg, "GET", f"{R}/commits/{ref}/status")
-        for s in st.get("statuses", []):
-            out.append(f"  status {s['context']}: {s['state']} {s.get('description') or ''}")
-        runs = gh_request(cfg, "GET", f"{R}/actions/runs", params={"head_sha": ref, "per_page": 20})
-        for w in runs.get("workflow_runs", []):
-            out.append(f"  workflow run {w['id']} '{w['name']}': {w['status']}/{w.get('conclusion')} {w['html_url']}")
-        if len(out) == 1:
-            out.append("  (no checks yet – CI may not be configured or not started; wait and retry)")
-        return "\n".join(out)
+        wait = min(max(int(kw.get("wait") or 0), 0), 900)
+        deadline = time.time() + wait
+        while True:
+            report, pending = _checks(ctx, cfg, R, n, kw.get("ref"))
+            if not pending or time.time() >= deadline or ctx.stop_event.is_set():
+                if pending and wait:
+                    report += f"\n  (still pending after waiting {wait}s)"
+                return report
+            time.sleep(min(20.0, max(1.0, deadline - time.time())))
     if action == "run_logs":
         rid = kw.get("run_id")
         jobs = gh_request(cfg, "GET", f"{R}/actions/runs/{rid}/jobs", params={"per_page": 50})
@@ -253,3 +244,47 @@ def github_api(ctx: ToolContext, method: str, path: str, params: dict | None = N
 def whoami(cfg) -> str:
     j = gh_request(cfg, "GET", "user")
     return j.get("login", "?")
+
+
+def _checks(ctx: ToolContext, cfg, R: str, n: Any, ref: str | None) -> tuple[str, bool]:
+    """One CI snapshot. Returns (report, pending). Green items are collapsed to keep
+    the result short (it is re-sent with every later model call)."""
+    if n and not ref:
+        ref = gh_request(cfg, "GET", f"{R}/pulls/{n}")["head"]["sha"]
+    if not ref:
+        ref = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(ctx.cwd), capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+    out = [f"Checks for {ref[:12]}:"]
+    ok: list[str] = []
+    pending = False
+    cr = gh_request(cfg, "GET", f"{R}/commits/{ref}/check-runs", params={"per_page": 100})
+    for c in cr.get("check_runs", []):
+        if c["status"] != "completed":
+            pending = True
+        if c.get("conclusion") in ("success", "skipped", "neutral"):
+            ok.append(c["name"])
+            continue
+        out.append(f"  {c['name']}: {c['status']}/{c.get('conclusion')} {c.get('html_url', '')}")
+        if c.get("conclusion") in ("failure", "timed_out") and c.get("output", {}).get("summary"):
+            out.append("    " + (c["output"]["summary"] or "")[:800].replace("\n", "\n    "))
+    st = gh_request(cfg, "GET", f"{R}/commits/{ref}/status")
+    for x in st.get("statuses", []):
+        if x["state"] == "pending":
+            pending = True
+        if x["state"] == "success":
+            ok.append(x["context"])
+            continue
+        out.append(f"  status {x['context']}: {x['state']} {x.get('description') or ''}")
+    runs = gh_request(cfg, "GET", f"{R}/actions/runs", params={"head_sha": ref, "per_page": 20})
+    for w in runs.get("workflow_runs", []):
+        if w["status"] != "completed":
+            pending = True
+        if w.get("conclusion") == "success":
+            continue
+        out.append(f"  workflow run {w['id']} '{w['name']}': {w['status']}/{w.get('conclusion')} {w['html_url']}")
+    if ok:
+        out.append(f"  passed ({len(ok)}): " + ", ".join(ok[:30]))
+    if len(out) == 1:
+        out.append("  (no checks yet – CI may not be configured or not started; retry with wait=60)")
+        pending = False
+    return "\n".join(out), pending

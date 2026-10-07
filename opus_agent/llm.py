@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from . import models as model_catalog
 from .security import log, redact
 
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
@@ -100,15 +101,15 @@ class LLMClient:
     def __init__(self, cfg, api_key: str) -> None:
         self.cfg = cfg
         self.api_key = api_key
-        self.base = cfg["base_url"].rstrip("/")
-        self.url = self.base + "/messages" if not self.base.endswith("/messages") else self.base
+        base = cfg["base_url"].rstrip("/")
+        for suffix in ("/messages", "/chat/completions"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+        self.base = base
+        self.url = self.base + "/messages"
+        self.oa_url = self.base + "/chat/completions"
         self.total = Usage()
-        # feature flags that get disabled automatically if endpoint rejects them
-        self.thinking_mode = cfg.get("thinking", "adaptive")
-        self.allow_effort = bool(cfg.get("effort"))
-        self.allow_cache = bool(cfg.get("prompt_caching", True))
-        self.allow_stream = bool(cfg.get("stream", True))
-        self.allow_cache_ttl = cfg.get("cache_ttl", "5m") == "1h"
+        self.reset_features()
         timeout = httpx.Timeout(
             connect=cfg.get("connect_timeout", 30),
             read=cfg.get("request_timeout", 600),
@@ -117,13 +118,31 @@ class LLMClient:
         )
         self.http = httpx.Client(timeout=timeout, http2=False, follow_redirects=True)
 
+    def reset_features(self) -> None:
+        """(Re)initialise the optional-feature flags. Called on model switch, because a
+        parameter rejected by one model may be supported by another."""
+        cfg = self.cfg
+        # feature flags that get disabled automatically if endpoint rejects them
+        self.thinking_mode = cfg.get("thinking", "adaptive")
+        self.allow_effort = bool(cfg.get("effort"))
+        self.allow_cache = bool(cfg.get("prompt_caching", True))
+        self.allow_stream = bool(cfg.get("stream", True))
+        self.allow_cache_ttl = cfg.get("cache_ttl", "5m") == "1h"
+        # OpenAI chat-completions flags
+        self.oa_max_completion = True     # max_completion_tokens (new) vs max_tokens (legacy)
+        self.oa_effort = bool(cfg.get("effort"))
+        self.oa_stream_usage = True       # stream_options.include_usage
+
+    def api_format(self, model: str | None = None) -> str:
+        return model_catalog.api_for(model or self.cfg["model"], self.cfg.get("api_format", "auto"))
+
     # ------------------------------------------------------------------
     def headers(self) -> dict[str, str]:
         h = {
             "content-type": "application/json",
             "anthropic-version": self.cfg.get("anthropic_version", "2023-06-01"),
             "accept": "application/json",
-            "user-agent": "opus-agent/1.0 (termux)",
+            "user-agent": "opus-agent/1.1 (termux)",
         }
         style = self.cfg.get("auth_style", "both")
         if style in ("x-api-key", "both"):
@@ -149,11 +168,15 @@ class LLMClient:
             cc: dict[str, Any] = {"type": "ephemeral"}
             if self.allow_cache_ttl:
                 cc["ttl"] = "1h"
-            # breakpoint 1: tools (static), 2: system, 3-4: tail of conversation
-            if tools:
-                tools[-1]["cache_control"] = dict(cc)
+            # Cache is prefix-based (tools -> system -> messages), max 4 breakpoints:
+            # 1: static system block (covers tools + static prompt, shared by every session),
+            # 2: dynamic system block (env/memory), 3-4: tail of the conversation.
             if sys_blocks:
-                sys_blocks[-1]["cache_control"] = dict(cc)
+                sys_blocks[0]["cache_control"] = dict(cc)
+                if len(sys_blocks) > 1:
+                    sys_blocks[-1]["cache_control"] = dict(cc)
+            elif tools:
+                tools[-1]["cache_control"] = dict(cc)
             _mark_tail_cache(msgs, dict(cc), count=2)
         payload: dict[str, Any] = {
             "model": model,
@@ -189,9 +212,16 @@ class LLMClient:
             if cb.should_stop():
                 raise Interrupted()
             stream = self.allow_stream
-            payload = self.build_payload(system, messages, tools, model, max_tokens, thinking, stream)
+            openai = self.api_format(model) == "openai"
+            if openai:
+                payload = self.build_openai_payload(system, messages, tools, model, max_tokens, stream)
+            else:
+                payload = self.build_payload(system, messages, tools, model, max_tokens, thinking, stream)
             try:
-                resp = self._stream(payload, cb) if stream else self._plain(payload)
+                if openai:
+                    resp = self._oa_stream(payload, cb) if stream else self._oa_plain(payload)
+                else:
+                    resp = self._stream(payload, cb) if stream else self._plain(payload)
                 self.total.add(resp.usage)
                 self.total.requests += 1
                 log.info("llm ok model=%s stop=%s usage=%s", payload["model"], resp.stop_reason,
@@ -201,11 +231,12 @@ class LLMClient:
                 raise
             except LLMError as e:
                 if e.status == 400 or e.status == 422:
-                    if self._downgrade(e):
+                    if (self._oa_downgrade(e) if openai else self._downgrade(e)):
                         continue
                     low = (e.body or str(e)).lower()
                     if "prompt is too long" in low or "context" in low and "length" in low \
-                            or "too many tokens" in low or "maximum context" in low:
+                            or "too many tokens" in low or "maximum context" in low \
+                            or "context_length_exceeded" in low:
                         raise ContextTooLong(str(e), e.status, e.body)
                     raise
                 if e.status in (401, 403):
@@ -405,6 +436,225 @@ class LLMClient:
         # drop empty text blocks (API rejects them on the next turn)
         content = [b for b in content if not (b.get("type") == "text" and not b.get("text"))]
         return Response(content, stop_reason or "end_turn", usage, model)
+
+    # ================================================================== OpenAI format
+    # GPT models on Tooken Club use /v1/chat/completions. Internally the agent keeps
+    # Anthropic-shaped messages; we convert on the way out and back.
+    def build_openai_payload(self, system: str | list, messages: list, tools: list | None,
+                             model: str | None, max_tokens: int | None, stream: bool) -> dict[str, Any]:
+        model = model or self.cfg["model"]
+        max_tokens = max_tokens or self.cfg.get("max_tokens", 32000)
+        sys_text = system if isinstance(system, str) else "\n\n".join(
+            b.get("text", "") for b in system if b.get("type") == "text")
+        out: list[dict[str, Any]] = [{"role": "system", "content": sys_text}] if sys_text else []
+        out += to_openai_messages(messages)
+        payload: dict[str, Any] = {"model": model, "messages": out}
+        payload["max_completion_tokens" if self.oa_max_completion else "max_tokens"] = max_tokens
+        if tools:
+            payload["tools"] = [{"type": "function", "function": {
+                "name": t["name"], "description": t.get("description", ""),
+                "parameters": t.get("input_schema") or {"type": "object", "properties": {}}}} for t in tools]
+        if stream:
+            payload["stream"] = True
+            if self.oa_stream_usage:
+                payload["stream_options"] = {"include_usage": True}
+        eff = (self.cfg.get("effort") or "").strip()
+        if self.oa_effort and eff:
+            payload["reasoning_effort"] = {"max": "high"}.get(eff, eff)
+        return payload
+
+    def _oa_downgrade(self, e: LLMError) -> bool:
+        body = (e.body or str(e)).lower()
+        if self.oa_max_completion and "max_completion_tokens" in body:
+            self.oa_max_completion = False
+            return True
+        if self.oa_effort and ("reasoning_effort" in body or "reasoning" in body):
+            self.oa_effort = False
+            return True
+        if self.oa_stream_usage and "stream_options" in body:
+            self.oa_stream_usage = False
+            return True
+        if self.allow_stream and "stream" in body:
+            self.allow_stream = False
+            return True
+        return False
+
+    def _oa_plain(self, payload: dict[str, Any]) -> Response:
+        payload = dict(payload)
+        payload.pop("stream", None)
+        payload.pop("stream_options", None)
+        r = self.http.post(self.oa_url, headers=self.headers(), json=payload)
+        body = r.text
+        if r.status_code >= 400:
+            self._raise_for(r, body)
+        return _oa_response(json.loads(body))
+
+    def _oa_stream(self, payload: dict[str, Any], cb: Callbacks) -> Response:
+        text = ""
+        calls: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] = {}
+        finish = None
+        model = ""
+        got_any = False
+        with self.http.stream("POST", self.oa_url, headers=self.headers(), json=payload) as r:
+            if r.status_code >= 400:
+                self._raise_for(r, r.read().decode("utf-8", "replace"))
+            ctype = r.headers.get("content-type", "")
+            if "text/event-stream" not in ctype and "stream" not in ctype:
+                self.allow_stream = False
+                resp = _oa_response(json.loads(r.read().decode("utf-8", "replace")))
+                if resp.text:
+                    cb.on_text(resp.text)
+                return resp
+            for line in r.iter_lines():
+                if cb.should_stop():
+                    raise Interrupted()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data:
+                    continue
+                if data == "[DONE]":
+                    break
+                ev = json.loads(data)
+                got_any = True
+                if ev.get("error"):
+                    err = ev["error"]
+                    raise LLMError(f"stream error: {err}", 529 if "overload" in str(err).lower() else 500,
+                                   json.dumps(err))
+                model = ev.get("model") or model
+                if ev.get("usage"):
+                    usage = _oa_usage(ev["usage"])
+                for ch in ev.get("choices") or []:
+                    d = ch.get("delta") or {}
+                    if d.get("reasoning_content") or d.get("reasoning"):
+                        cb.on_thinking(str(d.get("reasoning_content") or d.get("reasoning")))
+                    if d.get("content"):
+                        text += d["content"]
+                        cb.on_text(d["content"])
+                    for tc in d.get("tool_calls") or []:
+                        i = tc.get("index", 0)
+                        c = calls.setdefault(i, {"id": "", "name": "", "args": ""})
+                        if tc.get("id"):
+                            c["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            if not c["name"]:
+                                cb.on_tool_start(fn["name"])
+                            c["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            c["args"] += fn["arguments"]
+                    if ch.get("finish_reason"):
+                        finish = ch["finish_reason"]
+        if not got_any:
+            raise LLMError("empty stream", 502)
+        if finish is None and not text and not calls:
+            raise LLMError("stream ended prematurely", 502)
+        content: list[dict[str, Any]] = [{"type": "text", "text": text}] if text else []
+        for i in sorted(calls):
+            content.append(_oa_tool_block(calls[i]["id"], calls[i]["name"], calls[i]["args"]))
+        for b in content:
+            cb.on_block_end(b)
+        return Response(content, _oa_stop(finish, bool(calls)), usage, model)
+
+
+def _oa_stop(finish: str | None, has_calls: bool) -> str:
+    if has_calls or finish in ("tool_calls", "function_call"):
+        return "tool_use"
+    return {"length": "max_tokens", "content_filter": "refusal"}.get(finish or "", "end_turn")
+
+
+def _oa_usage(u: dict[str, Any]) -> dict[str, int]:
+    prompt = int(u.get("prompt_tokens") or 0)
+    cached = int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    return {"input_tokens": max(0, prompt - cached), "cache_read_input_tokens": cached,
+            "cache_creation_input_tokens": 0, "output_tokens": int(u.get("completion_tokens") or 0)}
+
+
+def _oa_tool_block(cid: str, name: str, args: str) -> dict[str, Any]:
+    try:
+        inp = json.loads(args) if args.strip() else {}
+        if not isinstance(inp, dict):
+            inp = {"value": inp}
+    except ValueError:
+        inp = {"__invalid_json__": args[:2000]}
+    return {"type": "tool_use", "id": cid or f"call_{random.getrandbits(48):x}", "name": name, "input": inp}
+
+
+def _oa_response(j: dict[str, Any]) -> Response:
+    if j.get("error"):
+        err = j["error"]
+        raise LLMError(str(err), 529 if "overload" in str(err).lower() else 400, json.dumps(err))
+    ch = (j.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    content: list[dict[str, Any]] = []
+    if msg.get("content"):
+        content.append({"type": "text", "text": msg["content"]})
+    calls = msg.get("tool_calls") or []
+    for tc in calls:
+        fn = tc.get("function") or {}
+        content.append(_oa_tool_block(tc.get("id", ""), fn.get("name", ""), fn.get("arguments") or ""))
+    return Response(content, _oa_stop(ch.get("finish_reason"), bool(calls)), _oa_usage(j.get("usage") or {}),
+                    j.get("model", ""))
+
+
+def _oa_text(c: Any) -> str:
+    if isinstance(c, str):
+        return c
+    return "\n".join(x.get("text", "") for x in c or [] if x.get("type") == "text")
+
+
+def _oa_image(b: dict[str, Any]) -> dict[str, Any] | None:
+    src = b.get("source") or {}
+    if src.get("type") == "base64":
+        return {"type": "image_url", "image_url": {"url": f"data:{src.get('media_type')};base64,{src.get('data')}"}}
+    if src.get("type") == "url":
+        return {"type": "image_url", "image_url": {"url": src.get("url")}}
+    return None
+
+
+def to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Anthropic-shaped history -> OpenAI chat messages. Thinking blocks are dropped
+    (they are model-specific), tool_result blocks become role=tool messages."""
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        c = m.get("content")
+        blocks = [{"type": "text", "text": c}] if isinstance(c, str) else list(c or [])
+        if m["role"] == "assistant":
+            text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            calls = [{"id": b["id"], "type": "function",
+                      "function": {"name": b.get("name", ""),
+                                   "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False)}}
+                     for b in blocks if b.get("type") == "tool_use"]
+            msg: dict[str, Any] = {"role": "assistant", "content": text or None}
+            if calls:
+                msg["tool_calls"] = calls
+            if text or calls:
+                out.append(msg)
+            continue
+        parts: list[dict[str, Any]] = []
+        for b in blocks:
+            t = b.get("type")
+            if t == "tool_result":
+                rc = b.get("content")
+                body = _oa_text(rc) or "(no output)"
+                if b.get("is_error"):
+                    body = "ERROR: " + body
+                out.append({"role": "tool", "tool_call_id": b.get("tool_use_id", ""), "content": body})
+                if isinstance(rc, list):  # images returned by read_file
+                    parts += [p for p in (_oa_image(x) for x in rc if x.get("type") == "image") if p]
+            elif t == "text" and b.get("text"):
+                parts.append({"type": "text", "text": b["text"]})
+            elif t == "image":
+                p = _oa_image(b)
+                if p:
+                    parts.append(p)
+        if parts:
+            if all(p["type"] == "text" for p in parts):
+                out.append({"role": "user", "content": "\n\n".join(p["text"] for p in parts)})
+            else:
+                out.append({"role": "user", "content": parts})
+    return out
 
 
 def _mark_tail_cache(msgs: list[dict[str, Any]], cc: dict[str, Any], count: int = 2) -> None:

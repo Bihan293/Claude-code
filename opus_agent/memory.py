@@ -111,7 +111,7 @@ class Memory:
         pm = self.read("project").strip()
         if pm:
             parts.append(f"<project_memory project=\"{self.root}\">\n{pm}\n</project_memory>")
-        j = self.journal_entries()[-5:]
+        j = [e[:700] for e in self.journal_entries()[-3:]]
         if j:
             parts.append("<recent_tasks_in_this_project>\n" + "\n\n".join(j) + "\n</recent_tasks_in_this_project>")
         for path, text in self.instruction_files():

@@ -36,7 +36,8 @@ SLASH_HELP = """[bold]Slash commands[/]
   /continue             continue an interrupted task
   /sessions             list sessions;  /resume <id>
   /mode auto|ask|plan   autonomy: auto=full, ask=confirm writes/shell, plan=read-only planning
-  /model [name]         show/switch model;  /thinking adaptive|enabled|off
+  /model [1|2|3|name]   list models / switch: 1 Opus 5.5, 2 GPT-6.1 Sol, 3 Sonnet 5.5
+  /thinking adaptive|enabled|off
   /undo [n]             revert file changes of the last n turns
   /diff                 git diff --stat of the working tree
   /cd <path>            change project directory;  /projects  list ~/projects
@@ -119,6 +120,7 @@ class Runner:
         self.cfg = cfg
         self.ui = ui
         self.interactive = interactive
+        self.pending_model = False   # set by bare /model: next input "1|2|3" selects a model
         self.session = session or Session(cwd=str(Path.cwd()))
         self.agent = Agent(cfg, self.session, ui, interactive=interactive)
 
@@ -186,7 +188,8 @@ class Runner:
 # ====================================================================== REPL
 def repl(cfg, args, runner: Runner, initial: str | None) -> int:
     ui = runner.ui
-    ui.console.print(f"[bold cyan]opus-agent {__version__}[/] · model [bold]{cfg['model']}[/] · "
+    from .models import display_name
+    ui.console.print(f"[bold cyan]opus-agent {__version__}[/] · model [bold]{display_name(cfg['model'])}[/] · "
                      f"mode [bold]{cfg.get('permission_mode')}[/] · [dim]{runner.agent.ctx.cwd}[/]")
     br = git_out(["rev-parse", "--abbrev-ref", "HEAD"], runner.agent.ctx.cwd)
     if br:
@@ -208,6 +211,16 @@ def repl(cfg, args, runner: Runner, initial: str | None) -> int:
         if line is None:
             break
         line = line.strip()
+        if runner.pending_model:
+            # answer to the /model menu: "1" / "2" / "3" (or empty = keep current)
+            runner.pending_model = False
+            from .models import MODELS, display_name
+            if not line:
+                ui.info(f"model: {display_name(cfg['model'])}")
+                continue
+            if line in {m.num for m in MODELS}:
+                switch_model(cfg, runner, line)
+                continue
         if not line:
             continue
         if line.startswith("/"):
@@ -322,9 +335,13 @@ def slash(cfg, runner: Runner, line: str):
             cfg.set("permission_mode", m)
             ui.info(f"mode → {m}")
     elif cmd == "/model":
-        if arg:
-            cfg.set("model", arg)
-        ui.info(f"model: {cfg['model']}")
+        from . import models
+        if not arg:
+            ui.console.print(models.menu(cfg["model"]), markup=False)
+            ui.console.print("[dim]напишите 1, 2 или 3 (Enter — оставить текущую)[/]")
+            runner.pending_model = True
+            return None
+        switch_model(cfg, runner, arg)
     elif cmd == "/thinking":
         if arg in ("adaptive", "enabled", "off"):
             cfg.set("thinking", arg)
@@ -391,6 +408,24 @@ def slash(cfg, runner: Runner, line: str):
     else:
         ui.error(f"unknown command {cmd}; /help")
     return None
+
+
+def switch_model(cfg, runner: "Runner", choice: str) -> None:
+    from . import models
+    ui = runner.ui
+    new = models.resolve(choice)
+    if not new:
+        return
+    if new == cfg["model"]:
+        ui.info(f"model: {models.display_name(new)} (уже выбрана)")
+        return
+    cfg.set("model", new)
+    llm = runner.agent.llm
+    llm.reset_features()          # flags downgraded for the old model may work for the new one
+    from . import context as ctxm
+    ctxm.strip_thinking(runner.session.messages)  # thinking signatures are model-specific
+    runner.agent.save()
+    ui.info(f"model → {models.display_name(new)} · API {llm.api_format(new)}")
 
 
 # ====================================================================== subcommands
@@ -678,7 +713,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cd:
         os.chdir(os.path.expanduser(args.cd))
     if args.model:
-        cfg.data["model"] = args.model
+        from .models import resolve
+        cfg.data["model"] = resolve(args.model) or cfg.data["model"]
     if args.mode:
         cfg.data["permission_mode"] = {"plan": "readonly"}.get(args.mode, args.mode)
     if args.detach:

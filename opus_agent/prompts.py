@@ -42,9 +42,9 @@ Do not commit secrets, build artifacts, or large binaries; respect .gitignore.
 environment – never put tokens in URLs or files.
 - Create the PR with the `github` tool (action=pr_create) with a clear title and a body containing: \
 summary, list of changes, how it was tested, and notes/risks. If a PR for the branch exists it is updated.
-- After pushing, check CI with github action=checks (wait/poll with `bash sleep 30` between polls \
-for up to ~10 minutes if checks are pending). If CI fails, fetch logs (action=run_logs), fix, commit, \
-push again, and re-check.
+- After pushing, check CI with github action=checks and wait=600: the tool itself waits until the \
+checks finish, so do not poll with `sleep` (every extra poll re-sends the whole context). If CI fails, \
+fetch logs (action=run_logs), fix, commit, push again, and re-check.
 - For issue-driven work, read the issue (action=issue_get) and reference it in the PR body \
 ("Closes #N").
 
@@ -54,7 +54,11 @@ several greps) MUST be batched in a single response – they run in parallel.
 - Read only what you need: use grep/glob to locate, then read_file with offset/limit for big files. \
 Don't re-read files you have already seen unless they changed.
 - Keep shell output small: use flags like -q, --quiet, `| tail -n 50`, `| head`, `--tb=short` for \
-pytest, etc.
+pytest, etc. Run the full test suite once at the end; while iterating on a failure re-run only the \
+failing tests (e.g. `pytest -q -x path::test`). Don't re-run checks when nothing changed.
+- Every tool result stays in the context and is re-sent on each later call, so avoid redundant calls: \
+don't list/glob what you already know, don't `cat` files (use read_file), don't verify a successful \
+edit by re-reading the file.
 - Environment is Termux: install system packages with `pkg install -y <name>`, Python libs with \
 `pip install`, Node with `npm`. There is no root/sudo, no systemd, no Docker. /tmp may not be \
 writable – use $TMPDIR or $PREFIX/tmp. Some binary wheels may be unavailable; prefer pure-Python \
@@ -124,11 +128,32 @@ def environment(cwd: Path) -> str:
     return "<environment>\n" + "\n".join(lines) + "\n</environment>"
 
 
-def build_system(cwd: Path, memory_text: str, plan_mode: bool = False, subagent: bool = False) -> list[dict]:
-    static = (SUBAGENT + "\n\n" + CORE) if subagent else CORE
-    if plan_mode:
-        static += PLAN_MODE
-    dynamic = environment(cwd)
+EXPLORE_MODE = """
+# EXPLORE MODE (read-only sub-agent)
+Tools that modify files or run shell commands (write_file, edit_file, multi_edit, delete_path, \
+move_path, bash, job_kill, task, ask_user) are disabled for you and will return an error. Use only \
+read-only tools."""
+
+
+def role_block(plan_mode: bool = False, subagent: bool = False, explore: bool = False) -> str:
+    parts = []
+    if subagent:
+        parts.append(SUBAGENT)
+        parts.append("The `task` and `ask_user` tools are not available to sub-agents.")
+    if explore or (plan_mode and subagent):
+        parts.append(EXPLORE_MODE.strip())
+    elif plan_mode:
+        parts.append(PLAN_MODE.strip())
+    return "\n\n".join(parts)
+
+
+def build_system(cwd: Path, memory_text: str, plan_mode: bool = False, subagent: bool = False,
+                 explore: bool = False) -> list[dict]:
+    """Block 0 (CORE) is byte-identical for every session, sub-agent and mode, so together with
+    the (also identical) tool list it is served from the prompt cache. Mode/role text and the
+    environment go into block 1."""
+    dynamic = role_block(plan_mode, subagent, explore)
+    dynamic = (dynamic + "\n\n" if dynamic else "") + environment(cwd)
     if memory_text and not subagent:
         dynamic += "\n\n" + memory_text
-    return [{"type": "text", "text": static}, {"type": "text", "text": dynamic}]
+    return [{"type": "text", "text": CORE}, {"type": "text", "text": dynamic}]

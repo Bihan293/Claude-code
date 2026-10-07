@@ -45,6 +45,25 @@ def message_events(blocks, stop_reason="end_turn", usage=None):
     return ev
 
 
+def openai_sse(text="", tool_calls=None, finish="stop", usage=None):
+    """OpenAI chat.completions streaming body. tool_calls: [(id, name, args_dict)]."""
+    chunks = []
+    if text:
+        for part in (text[:3], text[3:]):
+            if part:
+                chunks.append({"model": "gpt-6.1-sol", "choices": [{"index": 0, "delta": {"content": part}}]})
+    for i, (cid, name, args) in enumerate(tool_calls or []):
+        js = json.dumps(args)
+        chunks.append({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": i, "id": cid, "type": "function", "function": {"name": name, "arguments": js[:4]}}]}}]})
+        chunks.append({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": i, "function": {"arguments": js[4:]}}]}}]})
+    chunks.append({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if tool_calls else finish}]})
+    chunks.append({"choices": [], "usage": usage or {"prompt_tokens": 120, "completion_tokens": 15,
+                                                     "prompt_tokens_details": {"cached_tokens": 100}}})
+    return "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+
+
 class MockAnthropic:
     """Scripted Anthropic Messages endpoint. `script` is a list of callables(request_json) -> (status, events|body)."""
 
@@ -60,13 +79,21 @@ class MockAnthropic:
             def do_POST(self):
                 n = int(self.headers.get("content-length", 0))
                 body = json.loads(self.rfile.read(n))
-                mock.requests.append({"headers": dict(self.headers), "body": body})
+                mock.requests.append({"headers": dict(self.headers), "body": body, "path": self.path})
                 step = mock.script.pop(0) if mock.script else (lambda b: (200, message_events([{"type": "text", "text": "done"}])))
                 status, payload = step(body)
                 if status != 200:
                     data = json.dumps(payload).encode()
                     self.send_response(status)
                     self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if isinstance(payload, (bytes, str)):   # raw body (e.g. OpenAI SSE)
+                    data = payload.encode() if isinstance(payload, str) else payload
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream" if body.get("stream") else "application/json")
                     self.send_header("content-length", str(len(data)))
                     self.end_headers()
                     self.wfile.write(data)
@@ -89,7 +116,7 @@ class MockAnthropic:
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
 
     def close(self):
         self.server.shutdown()

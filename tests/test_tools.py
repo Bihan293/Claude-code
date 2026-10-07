@@ -49,7 +49,7 @@ def test_read_offset_and_grep_glob(tmp_path):
 
 def test_bash_background_and_timeout(tmp_path):
     c = ctx(tmp_path)
-    out, err = run_tool(c, "bash", {"command": "sleep 5", "timeout": 1})
+    out, err = run_tool(c, "bash", {"command": "sleep 3", "timeout": 1})
     assert "TIMED OUT" in out
     out, _ = run_tool(c, "bash", {"command": "echo hi; sleep 0.2; echo bye", "run_in_background": True})
     jid = out.split("job ")[1].split()[0]
