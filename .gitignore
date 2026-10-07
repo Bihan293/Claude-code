@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+# never commit local agent state or secrets
+.opus-agent/
+credentials.json
+*.log
+.env
